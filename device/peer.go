@@ -25,6 +25,8 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+	// awg is this peer's AmneziaWG obfuscation profile; nil means vanilla.
+	awg *awgProfile
 
 	endpoints struct {
 		sync.Mutex

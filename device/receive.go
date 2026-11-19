@@ -21,6 +21,7 @@ type QueueHandshakeElement struct {
 	packet   []byte
 	endpoint conn.Endpoint
 	buffer   *[MaxMessageSize]byte
+	awg      *awgProfile // matched AWG profile (nil = vanilla); used to frame a cookie reply
 }
 
 type QueueInboundElement struct {
@@ -132,7 +133,20 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			// check size of packet
 
 			packet := bufsArrs[i][:size]
-			msgType := binary.LittleEndian.Uint32(packet[:4])
+
+			// AmneziaWG single-port demux: classify against the canonical scheme
+			// (fast path) then each registered profile, and strip any Sn padding.
+			// The ranged type byte is left in place so mac1 verifies over the wire
+			// bytes; the parsed struct's Type is normalized in the handshake path.
+			msgType, padding, awgProf, classified := device.classifyInbound(packet)
+			if !classified {
+				device.Log.Verbosef("Received message with unknown type")
+				continue
+			}
+			if padding > 0 {
+				copy(packet, packet[padding:])
+				packet = packet[:len(packet)-padding]
+			}
 
 			switch msgType {
 
@@ -211,6 +225,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				buffer:   bufsArrs[i],
 				packet:   packet,
 				endpoint: endpoints[i],
+				awg:      awgProf,
 			}:
 				bufsArrs[i] = device.GetMessageBuffer()
 				bufs[i] = bufsArrs[i][:]
@@ -354,6 +369,9 @@ func (device *Device) RoutineHandshake(id int) {
 				device.Log.Errorf("Failed to decode initiation message")
 				goto skip
 			}
+			// normalize the (possibly AWG-ranged) type back to canonical; mac1 was
+			// already verified over the wire bytes above.
+			msg.Type = elem.msgType
 
 			// consume initiation
 
@@ -386,6 +404,7 @@ func (device *Device) RoutineHandshake(id int) {
 				device.Log.Errorf("Failed to decode response message")
 				goto skip
 			}
+			msg.Type = elem.msgType
 
 			// consume response
 

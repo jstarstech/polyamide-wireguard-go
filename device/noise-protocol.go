@@ -290,6 +290,12 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		Type:      MessageInitiationType,
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
+	// AmneziaWG H1: replace the type field with a value from the peer's range. The
+	// type is not part of the handshake hash, and AddMacs covers this randomized value.
+	if peer.awg != nil && peer.awg.isOn {
+		init, _, _, _ := peer.awg.effectiveHeaders()
+		msg.Type = init.Generate()
+	}
 
 	handshake.mixKey(msg.Ephemeral[:])
 	handshake.mixHash(msg.Ephemeral[:])
@@ -461,6 +467,11 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	var msg MessageResponse
 	msg.Type = MessageResponseType
+	// AmneziaWG H2: see the H1 note in CreateMessageInitiation.
+	if peer.awg != nil && peer.awg.isOn {
+		_, resp, _, _ := peer.awg.effectiveHeaders()
+		msg.Type = resp.Generate()
+	}
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 

@@ -122,6 +122,8 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("rx_bytes=%d", peer.rxBytes.Load())
 			sendf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval.Load())
 
+			peer.appendAwgConfig(sendf)
+
 			device.Allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
 				sendf("allowed_ip=%s", prefix.String())
 				return true
@@ -270,6 +272,7 @@ func (peer *ipcSetPeer) handlePostConfig() {
 		}
 		peer.SendStagedPackets()
 	}
+	peer.device.rebuildAwgClassifiers()
 }
 
 func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error {
@@ -303,6 +306,9 @@ func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error 
 }
 
 func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error {
+	if handled, err := device.handleAwgPeerLine(peer, key, value); handled {
+		return err
+	}
 	switch key {
 	case "update_only":
 		// allow disabling of creation

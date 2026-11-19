@@ -6,6 +6,7 @@
 package device
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -141,10 +142,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return nil
 	}
 	peer.endpoints.lastInitIndex = (peer.endpoints.lastInitIndex + 1) % len(peer.endpoints.val)
-	selEp := []conn.Endpoint{peer.endpoints.val[peer.endpoints.lastInitIndex]}
+	selEp := peer.endpoints.val[peer.endpoints.lastInitIndex]
 	peer.endpoints.Unlock()
 
-	err = peer.SendBuffers([][]byte{packet}, selEp)
+	bufs, eps := peer.wrapInitiation(packet, selEp)
+	err = peer.SendBuffers(bufs, eps)
 	if err != nil {
 		peer.device.Log.Verbosef("%v - Failed to send handshake initiation: %v", peer, err)
 	}
@@ -181,7 +183,7 @@ func (peer *Peer) SendHandshakeResponse(srcEndpoint conn.Endpoint) error {
 	peer.timersAnyAuthenticatedPacketSent()
 
 	// TODO: allocation could be avoided
-	err = peer.SendBuffers([][]byte{packet}, []conn.Endpoint{srcEndpoint})
+	err = peer.SendBuffers([][]byte{peer.wrapResponse(packet)}, []conn.Endpoint{srcEndpoint})
 	if err != nil {
 		peer.device.Log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
@@ -200,6 +202,14 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 
 	packet := make([]byte, MessageCookieReplySize)
 	_ = reply.marshal(packet)
+	// AmneziaWG H3/S3: frame the cookie reply for the peer that sent the (obfuscated)
+	// initiation. The reply type field is not part of the cookie AEAD. Best-effort.
+	if a := initiatingElem.awg; a != nil && a.isOn {
+		if _, _, cookie, _ := a.effectiveHeaders(); cookie != nil {
+			binary.LittleEndian.PutUint32(packet[:4], cookie.Generate())
+		}
+		packet = prependPadding(packet, a.paddings.cookie)
+	}
 	// TODO: allocation could be avoided
 	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
 
@@ -438,7 +448,15 @@ func (device *Device) RoutineEncryption(id int) {
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
 
-			binary.LittleEndian.PutUint32(fieldType, MessageTransportType)
+			// AmneziaWG H4: per-peer transport type. RoutineEncryption is shared
+			// across peers, so key off the element's own peer (nil = vanilla).
+			transportType := uint32(MessageTransportType)
+			if a := elem.peer.awg; a != nil && a.isOn {
+				if _, _, _, h := a.effectiveHeaders(); h != nil {
+					transportType = h.Generate()
+				}
+			}
+			binary.LittleEndian.PutUint32(fieldType, transportType)
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
@@ -546,9 +564,23 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		}
 		dataSent := false
 		elemsContainer.Lock()
+		// AmneziaWG S4: transport padding. RoutineSequentialSender is per-peer, so
+		// read S4 once. Shift the encrypted packet right by `pad` and fill the
+		// front with random bytes (the buffer has MaxMessageSize headroom).
+		s4 := 0
+		if a := peer.awg; a != nil && a.isOn {
+			s4 = a.paddings.transport
+		}
 		for _, elem := range elemsContainer.elems {
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
+			}
+			if s4 > 0 && len(elem.packet)+s4 <= len(elem.buffer) {
+				for i := len(elem.packet) - 1; i >= 0; i-- {
+					elem.buffer[i+s4] = elem.buffer[i]
+				}
+				rand.Read(elem.buffer[:s4])
+				elem.packet = elem.buffer[:s4+len(elem.packet)]
 			}
 			bufs = append(bufs, elem.packet)
 			eps = append(eps, elem.endpoint)

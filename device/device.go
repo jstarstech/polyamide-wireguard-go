@@ -58,6 +58,13 @@ type Device struct {
 		keyMap       map[NoisePublicKey]*Peer
 	}
 
+	// awgClassify holds the inbound AmneziaWG demux set (one entry per distinct
+	// profile), rebuilt after every UAPI set.
+	awgClassify struct {
+		sync.RWMutex
+		profiles []*awgProfile
+	}
+
 	rate struct {
 		underLoadUntil atomic.Int64
 		limiter        ratelimiter.Ratelimiter
