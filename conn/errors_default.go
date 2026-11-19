@@ -10,3 +10,7 @@ package conn
 func errShouldDisableUDPGSO(_ error) bool {
 	return false
 }
+
+func errGSOSegmentTooLarge(_ error) bool {
+	return false
+}

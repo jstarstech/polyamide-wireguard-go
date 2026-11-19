@@ -24,3 +24,19 @@ func errShouldDisableUDPGSO(err error) bool {
 	}
 	return false
 }
+
+// errGSOSegmentTooLarge reports whether err means the GSO segment size exceeds
+// the path MTU toward this particular destination.
+//
+// Segments of a GSO batch cannot be IP-fragmented, so where an ordinary
+// oversized datagram would just be fragmented, the kernel has no fallback and
+// rejects the entire send with EMSGSIZE. Unlike EIO -- a property of the NIC,
+// and so of the whole bind -- path MTU is a property of the route, so this
+// suppresses offload per destination rather than for every peer on the socket.
+func errGSOSegmentTooLarge(err error) bool {
+	var serr *os.SyscallError
+	if errors.As(err, &serr) {
+		return serr.Err == unix.EMSGSIZE
+	}
+	return false
+}

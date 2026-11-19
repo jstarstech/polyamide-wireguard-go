@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -44,8 +45,40 @@ type StdNetBind struct {
 	udpAddrPool sync.Pool
 	msgsPool    sync.Pool
 
+	// gsoBlocked records destinations whose path MTU is too small to carry a
+	// GSO segment, mapping netip.AddrPort to the time the suppression lapses.
+	// Not guarded by mu. Path MTU is a property of the route, not of the NIC,
+	// so a peer behind a constrained path must not cost every other peer on
+	// this socket its offload.
+	gsoBlocked sync.Map
+
 	blackhole4 bool
 	blackhole6 bool
+}
+
+// gsoSuppressionTTL bounds how long offload stays suppressed for a destination.
+// Linux expires learned path MTUs on a comparable timescale, so a route that
+// recovers gets offload back without needing a restart. The cost of re-probing
+// is one wasted syscall: the send is retried unsegmented in the same call, so
+// no packets are lost.
+const gsoSuppressionTTL = 10 * time.Minute
+
+// gsoSuppressed reports whether offload is currently suppressed for dst.
+func (s *StdNetBind) gsoSuppressed(dst netip.AddrPort) bool {
+	v, ok := s.gsoBlocked.Load(dst)
+	if !ok {
+		return false
+	}
+	if time.Now().After(v.(time.Time)) {
+		s.gsoBlocked.Delete(dst)
+		return false
+	}
+	return true
+}
+
+// suppressGSO disables offload toward dst until the TTL lapses.
+func (s *StdNetBind) suppressGSO(dst netip.AddrPort) {
+	s.gsoBlocked.Store(dst, time.Now().Add(gsoSuppressionTTL))
 }
 
 func NewStdNetBind() Bind {
@@ -375,6 +408,11 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 		return syscall.EAFNOSUPPORT
 	}
 
+	dst := endpoint.(*StdNetEndpoint).AddrPort
+	if offload && s.gsoSuppressed(dst) {
+		offload = false
+	}
+
 	msgs := s.getMessages()
 	usedMessages := 0
 	defer func() {
@@ -410,6 +448,15 @@ retry:
 				s.ipv4TxOffload = false
 			}
 			s.mu.Unlock()
+			retried = true
+			goto retry
+		}
+		if err != nil && offload && errGSOSegmentTooLarge(err) {
+			// This route cannot carry a segment this size. Suppress offload
+			// for this destination only and resend unsegmented, which the
+			// kernel is free to fragment. Every other peer keeps its offload.
+			s.suppressGSO(dst)
+			offload = false
 			retried = true
 			goto retry
 		}
