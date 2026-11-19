@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,13 +57,14 @@ type Transport struct {
 }
 
 type peer struct {
-	owner      *Transport
-	id         string
-	public     device.NoisePublicKey
-	passive    bool         // protected by ops
-	raw        *device.Peer // published under mu before startup. It does not change after startup.
-	retired    atomic.Bool
-	endpointMu sync.Mutex
+	owner       *Transport
+	id          string
+	public      device.NoisePublicKey
+	passive     bool         // protected by ops
+	obfuscation []string     // transport-specific UAPI lines (AmneziaWG); protected by ops
+	raw         *device.Peer // published under mu before startup. It does not change after startup.
+	retired     atomic.Bool
+	endpointMu  sync.Mutex
 	// learned is the last endpoint reported through Hooks.EndpointLearned.
 	learned atomic.Pointer[netip.AddrPort]
 }
@@ -163,6 +165,9 @@ func (t *Transport) attachPeer(dev *device.Device, p *peer) error {
 	}
 	raw.SetPreferRoaming(p.passive)
 	raw.SetEndpoints(slices.Clone(t.configuredEndpoints[p]))
+	if err := t.applyObfuscation(p); err != nil {
+		return err
+	}
 	t.mu.Lock()
 	p.raw = raw
 	t.byRaw[raw] = p
@@ -212,6 +217,40 @@ func (t *Transport) PreparePeer(ctx context.Context, cfg polyamide.PeerConfig) (
 	t.peers[public] = p
 	t.mu.Unlock()
 	return p, nil
+}
+
+// SetPeerObfuscation replaces a peer's obfuscation profile. The wireguard
+// transport interprets lines as AmneziaWG UAPI key=value pairs; an empty list
+// reverts the peer to vanilla. Idempotent: identical input is a no-op.
+func (t *Transport) SetPeerObfuscation(value polyamide.Peer, lines []string) error {
+	t.ops.Lock()
+	defer t.ops.Unlock()
+	p, err := t.checkPeer(value)
+	if err != nil {
+		return err
+	}
+	if slices.Equal(p.obfuscation, lines) {
+		return nil
+	}
+	p.obfuscation = slices.Clone(lines)
+	return t.applyObfuscation(p)
+}
+
+// applyObfuscation pushes the peer's profile over UAPI. awg_off first so a
+// changed or removed profile is rebuilt clean instead of merged onto stale
+// sub-fields; handlePostConfig then rebuilds the inbound classifier.
+func (t *Transport) applyObfuscation(p *peer) error {
+	if p.raw == nil || t.dev == nil {
+		return nil // attachPeer applies it once the device exists
+	}
+	key := hex.EncodeToString(p.public[:])
+	var b strings.Builder
+	fmt.Fprintf(&b, "public_key=%s\nawg_off=true\n", key)
+	for _, line := range p.obfuscation {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return t.dev.IpcSet(b.String())
 }
 
 func (t *Transport) checkPeer(value polyamide.Peer) (*peer, error) {
