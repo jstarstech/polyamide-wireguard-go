@@ -165,13 +165,14 @@ func (t *Transport) attachPeer(dev *device.Device, p *peer) error {
 	}
 	raw.SetPreferRoaming(p.passive)
 	raw.SetEndpoints(slices.Clone(t.configuredEndpoints[p]))
-	if err := t.applyObfuscation(p); err != nil {
-		return err
-	}
 	t.mu.Lock()
 	p.raw = raw
 	t.byRaw[raw] = p
 	t.mu.Unlock()
+	// Apply after p.raw is published: applyObfuscation needs the device peer.
+	if err := t.applyObfuscation(p); err != nil {
+		return err
+	}
 	if t.started.Load() {
 		raw.Start()
 	}
